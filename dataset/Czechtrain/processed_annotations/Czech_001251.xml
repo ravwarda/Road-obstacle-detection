@@ -1,0 +1,36 @@
+<annotation>
+  <folder>images</folder>
+  <filename>Czech_001251.jpg</filename>
+  <size>
+    <depth>3</depth>
+    <width>600</width>
+    <height>600</height>
+  </size>
+  <object>
+    <name>D40</name>
+    <bndbox>
+      <xmin>349</xmin>
+      <ymin>46</ymin>
+      <xmax>390</xmax>
+      <ymax>60</ymax>
+    </bndbox>
+  </object>
+  <object>
+    <name>D00</name>
+    <bndbox>
+      <xmin>465</xmin>
+      <ymin>77</ymin>
+      <xmax>491</xmax>
+      <ymax>141</ymax>
+    </bndbox>
+  </object>
+  <object>
+    <name>D00</name>
+    <bndbox>
+      <xmin>280</xmin>
+      <ymin>118</ymin>
+      <xmax>341</xmax>
+      <ymax>156</ymax>
+    </bndbox>
+  </object>
+</annotation>

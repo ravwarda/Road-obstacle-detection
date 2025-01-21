@@ -3,181 +3,20 @@ import matplotlib.pyplot as plt
 import cv2
 import torch
 import os
-from tqdm import tqdm
-from sklearn.metrics import accuracy_score
+import xml.etree.ElementTree as ET
+from shutil import copyfile
 
-from transformers import AutoImageProcessor, SegformerForSemanticSegmentation, SegformerImageProcessor, SegformerConfig
-from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
-from torch import nn
-import evaluate
-
-
-def segmentation_model_training(epochs=10):
-    class SemanticSegmentationDataset(Dataset):
-        """Image (semantic) segmentation dataset."""
-
-        def __init__(self, root_dir, image_processor, train=True):
-            """
-            Args:
-                root_dir (string): Root directory of the dataset containing the images + annotations.
-                image_processor (SegFormerImageProcessor): image processor to prepare images + segmentation maps.
-                train (bool): Whether to load "training" or "validation" images + annotations.
-            """
-            self.root_dir = root_dir
-            self.image_processor = image_processor
-            self.train = train
-
-            # sub_path = "training" if self.train else "validation"
-            self.img_dir = os.path.join(self.root_dir, "image_2")
-            self.ann_dir = os.path.join(self.root_dir, "gt_image_2")
-
-            # read images
-            image_file_names = []
-            for root, dirs, files in os.walk(self.img_dir):
-                image_file_names.extend(files)
-            self.images = sorted(image_file_names)
-
-            # read annotations
-            annotation_file_names = []
-            for root, dirs, files in os.walk(self.ann_dir):
-                annotation_file_names.extend(files)
-            self.annotations = sorted(annotation_file_names)
-
-            assert len(self.images) == len(self.annotations), "There must be as many images as there are segmentation maps"
-
-        def __len__(self):
-            return len(self.images)
-
-        def __getitem__(self, idx):
-
-            image = cv2.imread(os.path.join(self.img_dir, self.images[idx]))
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            segmentation_map = cv2.imread(os.path.join(self.ann_dir, self.annotations[idx]))
-            segmentation_map = cv2.cvtColor(segmentation_map, cv2.COLOR_BGR2GRAY)
-
-            # randomly crop + pad both image and segmentation map to same size
-            encoded_inputs = self.image_processor(image, segmentation_map, return_tensors="pt")
-
-            for k,v in encoded_inputs.items():
-                encoded_inputs[k].squeeze_() # remove batch dimension
-
-            return encoded_inputs
-        
-    root_dir = "dataset/Road_seg_train"
-    image_processor = SegformerImageProcessor(do_reduce_labels=True)
-
-    dataset = SemanticSegmentationDataset(root_dir, image_processor, train=True)
-    dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # config = SegformerConfig.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512")
-    # config.num_labels = 3
-    # model = SegformerForSemanticSegmentation.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512", config=config, ignore_mismatched_sizes=True).to(device)
-    model = SegformerForSemanticSegmentation.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512").to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.00006)
-    
-    metric = evaluate.load("mean_iou")
-
-    model.train()
-    last_ma = 0
-    not_improved_count = 0
-    for epoch in range(epochs):  # loop over the dataset multiple times
-        print("Epoch:", epoch)
-        for idx, batch in enumerate(tqdm(dataloader)):
-                # get the inputs;
-                pixel_values = batch["pixel_values"].to(device)
-                labels = batch["labels"].to(device)
-
-                # zero the parameter gradients
-                optimizer.zero_grad()
-
-                # forward + backward + optimize
-                outputs = model(pixel_values=pixel_values, labels=labels)
-                loss, logits = outputs.loss, outputs.logits
-
-                loss.backward()
-                optimizer.step()
-
-                # evaluate
-                with torch.no_grad():
-                    upsampled_logits = nn.functional.interpolate(logits, size=labels.shape[-2:], mode="bilinear", align_corners=False)
-                    predicted = upsampled_logits.argmax(dim=1)
-
-                    # note that the metric expects predictions + labels as numpy arrays
-                    metric.add_batch(predictions=predicted.detach().cpu().numpy(), references=labels.detach().cpu().numpy())
-
-                # let's print loss and metrics every 100 batches
-                if idx % 100 == 0:
-                    # currently using _compute instead of compute
-                    # see this issue for more info: https://github.com/huggingface/evaluate/pull/328#issuecomment-1286866576
-                    metrics = metric._compute(
-                            predictions=predicted.cpu(),
-                            references=labels.cpu(),
-                            num_labels=150,
-                            ignore_index=255,
-                            reduce_labels=False, # we've already reduced the labels ourselves
-                        )
-
-                    print("Loss:", loss.item())
-                    print("Mean_iou:", metrics["mean_iou"])
-                    print("Mean accuracy:", metrics["mean_accuracy"])
-
-                    if metrics["mean_accuracy"] < last_ma:
-                            not_improved_count += 1  
-                    else:
-                        not_improved_count = 0
-                        last_ma = metrics["mean_accuracy"] 
-        if not_improved_count > 4:
-            break
-    return model
+from transformers import AutoImageProcessor, SegformerForSemanticSegmentation, SegformerConfig
+from segformer_train import segmentation_model_training
+from image_processing import ade_palette, show_colormap_with_labels, show_colormap, extract_label
+from cnn import cnn_model_training, SimpleCNN, sliding_window, visualize_detections, load_bounding_box_data, visualize_bounding_boxes
 
 
 def image_segmentation(image, model):
-    def ade_palette():
-        """ADE20K palette that maps each class to RGB values."""
-        return [[120, 120, 120], [180, 120, 120], [6, 230, 230], [80, 50, 50],
-                [4, 200, 3], [120, 120, 80], [140, 140, 140], [204, 5, 255],
-                [230, 230, 230], [4, 250, 7], [224, 5, 255], [235, 255, 7],
-                [150, 5, 61], [120, 120, 70], [8, 255, 51], [255, 6, 82],
-                [143, 255, 140], [204, 255, 4], [255, 51, 7], [204, 70, 3],
-                [0, 102, 200], [61, 230, 250], [255, 6, 51], [11, 102, 255],
-                [255, 7, 71], [255, 9, 224], [9, 7, 230], [220, 220, 220],
-                [255, 9, 92], [112, 9, 255], [8, 255, 214], [7, 255, 224],
-                [255, 184, 6], [10, 255, 71], [255, 41, 10], [7, 255, 255],
-                [224, 255, 8], [102, 8, 255], [255, 61, 6], [255, 194, 7],
-                [255, 122, 8], [0, 255, 20], [255, 8, 41], [255, 5, 153],
-                [6, 51, 255], [235, 12, 255], [160, 150, 20], [0, 163, 255],
-                [140, 140, 140], [250, 10, 15], [20, 255, 0], [31, 255, 0],
-                [255, 31, 0], [255, 224, 0], [153, 255, 0], [0, 0, 255],
-                [255, 71, 0], [0, 235, 255], [0, 173, 255], [31, 0, 255],
-                [11, 200, 200], [255, 82, 0], [0, 255, 245], [0, 61, 255],
-                [0, 255, 112], [0, 255, 133], [255, 0, 0], [255, 163, 0],
-                [255, 102, 0], [194, 255, 0], [0, 143, 255], [51, 255, 0],
-                [0, 82, 255], [0, 255, 41], [0, 255, 173], [10, 0, 255],
-                [173, 255, 0], [0, 255, 153], [255, 92, 0], [255, 0, 255],
-                [255, 0, 245], [255, 0, 102], [255, 173, 0], [255, 0, 20],
-                [255, 184, 184], [0, 31, 255], [0, 255, 61], [0, 71, 255],
-                [255, 0, 204], [0, 255, 194], [0, 255, 82], [0, 10, 255],
-                [0, 112, 255], [51, 0, 255], [0, 194, 255], [0, 122, 255],
-                [0, 255, 163], [255, 153, 0], [0, 255, 10], [255, 112, 0],
-                [143, 255, 0], [82, 0, 255], [163, 255, 0], [255, 235, 0],
-                [8, 184, 170], [133, 0, 255], [0, 255, 92], [184, 0, 255],
-                [255, 0, 31], [0, 184, 255], [0, 214, 255], [255, 0, 112],
-                [92, 255, 0], [0, 224, 255], [112, 224, 255], [70, 184, 160],
-                [163, 0, 255], [153, 0, 255], [71, 255, 0], [255, 0, 163],
-                [255, 204, 0], [255, 0, 143], [0, 255, 235], [133, 255, 0],
-                [255, 0, 235], [245, 0, 255], [255, 0, 122], [255, 245, 0],
-                [10, 190, 212], [214, 255, 0], [0, 204, 255], [20, 0, 255],
-                [255, 255, 0], [0, 153, 255], [0, 41, 255], [0, 255, 204],
-                [41, 0, 255], [41, 255, 0], [173, 0, 255], [0, 245, 255],
-                [71, 0, 255], [122, 0, 255], [0, 255, 184], [0, 92, 255],
-                [184, 255, 0], [0, 133, 255], [255, 214, 0], [25, 194, 194],
-                [102, 255, 0], [92, 0, 255]]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    processor = AutoImageProcessor.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512")
+    processor = AutoImageProcessor.from_pretrained("nvidia/segformer-b2-finetuned-ade-512-512")
     
     pixel_values = processor(image, return_tensors="pt").pixel_values.to(device)
 
@@ -185,7 +24,8 @@ def image_segmentation(image, model):
         outputs = model(pixel_values)
         logits = outputs.logits
 
-    predicted_segmentation_map = processor.post_process_semantic_segmentation(outputs, target_sizes=[image[:,:,0].shape[::-1]])[0]
+    target_size = image.shape[:2]
+    predicted_segmentation_map = processor.post_process_semantic_segmentation(outputs, target_sizes=[target_size])[0]
     predicted_segmentation_map = predicted_segmentation_map.cpu().numpy()
 
     color_seg = np.zeros((predicted_segmentation_map.shape[0],
@@ -201,28 +41,176 @@ def image_segmentation(image, model):
     img = image * 0.5 + color_seg * 0.5
     img = img.astype(np.uint8)
 
-    plt.figure(figsize=(15, 10))
-    plt.imshow(img)
+    return predicted_segmentation_map, img
+
+
+def adjust_bounding_boxes(annotation_path, output_annotation_path, x_offset, y_offset):
+    tree = ET.parse(annotation_path)
+    root = tree.getroot()
+
+    for obj in root.findall('object'):
+        bndbox = obj.find('bndbox')
+        xmin = int(bndbox.find('xmin').text) - x_offset
+        ymin = int(bndbox.find('ymin').text) - y_offset
+        xmax = int(bndbox.find('xmax').text) - x_offset
+        ymax = int(bndbox.find('ymax').text) - y_offset
+
+        bndbox.find('xmin').text = str(max(0, xmin))
+        bndbox.find('ymin').text = str(max(0, ymin))
+        bndbox.find('xmax').text = str(max(0, xmax))
+        bndbox.find('ymax').text = str(max(0, ymax))
+
+    tree.write(output_annotation_path)
+
+def process_images_and_annotations(image_dir, annotation_dir, output_image_dir, output_annotation_dir, seg_model):
+    if not os.path.exists(output_image_dir):
+        os.makedirs(output_image_dir)
+    if not os.path.exists(output_annotation_dir):
+        os.makedirs(output_annotation_dir)
+
+    for image_name in os.listdir(image_dir):
+        if image_name.endswith('.jpg'):
+            image_path = os.path.join(image_dir, image_name)
+            annotation_path = os.path.join(annotation_dir, image_name.replace('.jpg', '.xml'))
+
+            # Read and process the image
+            image = cv2.imread(image_path)
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            mask, segmented_image = image_segmentation(image, seg_model)
+            road_image, _, extract_bndbox = extract_label(image_rgb, mask, 0)
+            x_offset = extract_bndbox[2]
+            y_offset = extract_bndbox[0]
+
+            # Save the processed image
+            output_image_path = os.path.join(output_image_dir, image_name)
+            cv2.imwrite(output_image_path, cv2.cvtColor(road_image, cv2.COLOR_RGB2BGR))
+
+            # Adjust and save the annotation
+            output_annotation_path = os.path.join(output_annotation_dir, image_name.replace('.jpg', '.xml'))
+            adjust_bounding_boxes(annotation_path, output_annotation_path, x_offset, y_offset)
+
+
+def compare_models(device, image):
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+    model = SegformerForSemanticSegmentation.from_pretrained("nvidia/segformer-b2-finetuned-ade-512-512").to(device)
+
+    mask1, img1 = image_segmentation(image, model)
+    ex1, _, _ = extract_label(image_rgb, mask1, 6)
+
+    config = SegformerConfig.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512")
+    model = SegformerForSemanticSegmentation(config=config).to(device)
+    model.load_state_dict(torch.load("model_b0.pth", weights_only=True))
+
+    mask2, img2 = image_segmentation(image, model)
+    # show_colormap_with_labels(mask2)
+    ex2, _, _ = extract_label(image_rgb, mask2, 0)
+
+    plt.figure(figsize=(24, 8))
+    plt.subplot(1, 2, 1)
+    plt.imshow(image_rgb)
+    plt.title("Obraz wejściowy")
+    plt.subplot(1, 2, 2)
+    plt.imshow(cv2.cvtColor(img1, cv2.COLOR_BGR2RGB))
+    plt.title("Wynik segmentacji")
+    
+    plt.figure(figsize=(24, 8))
+    plt.subplot(2, 2, 1)
+    plt.imshow(cv2.cvtColor(img1, cv2.COLOR_BGR2RGB))
+    plt.title("Wynik segmentacji przed trenowaniem")
+    plt.subplot(2, 2, 2)
+    plt.imshow(cv2.cvtColor(img2, cv2.COLOR_BGR2RGB))
+    plt.title("Wynik segmentacji po trenowaniu")
+    plt.subplot(2, 2, 3)
+    plt.imshow(ex1)
+    plt.title("Wyekstraktowany obraz drogi")
+    plt.subplot(2, 2, 4)
+    plt.imshow(ex2)
+    plt.title("Wyekstraktowany obraz drogi")
     plt.show()
 
-    return predicted_segmentation_map
-
-
-def main(train_model=False):
-    image = cv2.imread("dataset/Czech/images/Czech_000019.jpg")
+def main(seg_train=False, obj_train=False):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = SegformerForSemanticSegmentation.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512").to(device)
 
-    image_segmentation(image, model)
-
-    if train_model:
-        model = segmentation_model_training(epochs=100)
-        torch.save(model.state_dict(), "model.pth")
+    # Training the model
+    if seg_train:
+        seg_model = segmentation_model_training(epochs=50, patience=5)
+        torch.save(seg_model.state_dict(), "model_b0.pth")
     else:
         config = SegformerConfig.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512")
-        model = SegformerForSemanticSegmentation(config=config).to(device)
-        model.load_state_dict(torch.load("model.pth", weights_only=True))
+        seg_model = SegformerForSemanticSegmentation(config=config).to(device)
+        seg_model.load_state_dict(torch.load("model_b0.pth", weights_only=True))
 
-    image_segmentation(image, model)
+    if obj_train:
+        det_model = cnn_model_training(epochs=50, patience=5)
+        torch.save(det_model.state_dict(), 'cnn_model.pth')
+    else:
+        # Model load
+        det_model = SimpleCNN()
+        det_model.load_state_dict(torch.load('cnn_model.pth', weights_only=False))
+        det_model = det_model.to(device)
+        det_model.eval()
 
-main(train_model=True)
+    # Test the model on a sample image
+
+    # image = cv2.imread("dataset/Czech/images/Czech_003521.jpg")
+    image = cv2.imread("dataset/Czech/images/Czech_002573.jpg")
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+    mask1, img1 = image_segmentation(image, seg_model)
+    road_image, _, _ = extract_label(image_rgb, mask1, 0)
+
+    # image_path = 'dataset/Czech/images/Czech_001697.jpg'
+    # image = cv2.imread(image_path)
+    windows = sliding_window(device, road_image, det_model, window_size=(64, 64), step_size=32)
+    visualize_detections(road_image, windows, window_size=(64, 64))
+    
+
+if __name__ == "__main__":
+    main(obj_train=True)
+
+
+
+    # Test image segmentation
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # image = cv2.imread("dataset/Czech/images/Czech_002573.jpg")
+    # compare_models(device, image)
+
+
+
+    # Train dataset segmentation
+    # image_dir = "dataset/Czechtrain/images"
+    # annotation_dir = "dataset/Czechtrain/annotations/xmls"
+    # output_image_dir = "dataset/Czechtrain/processed_images"
+    # output_annotation_dir = "dataset/Czechtrain/processed_annotations"
+
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # config = SegformerConfig.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512")
+    # model = SegformerForSemanticSegmentation(config=config).to(device)
+    # model.load_state_dict(torch.load("model_b0.pth", weights_only=True))
+
+    # # Assuming seg_model is already defined and loaded
+    # process_images_and_annotations(image_dir, annotation_dir, output_image_dir, output_annotation_dir, model)
+
+
+
+    # Nie wiem do czego to było, ale może jeszcze się przyda
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # image = cv2.imread("dataset/segmentation_data/test/ae49bf6d-00000000.jpg")
+    # config = SegformerConfig.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512")
+    # model = SegformerForSemanticSegmentation(config=config).to(device)
+    # model.load_state_dict(torch.load("model_b0.pth", weights_only=True))
+
+    # mask2, img2 = image_segmentation(image, model)
+    # img_cut, mask_filtered = extract_label(image, mask2, 0)
+
+    # fig = plt.figure(figsize=(24, 8))
+    # plt.subplot(1, 3, 1)
+    # plt.imshow(img2)
+    # plt.subplot(1, 3, 2)
+    # plt.imshow(mask_filtered)
+    # plt.subplot(1, 3, 3)
+    # plt.imshow(img_cut)
+    # plt.show()
