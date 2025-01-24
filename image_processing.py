@@ -66,7 +66,7 @@ def show_colormap(image, colormap):
     plt.axis('off')
     plt.show()
 
-def extract_label(image, mask, label):
+def extract_label_with_filter(image, mask, label):
     image = image.copy()
 
     # Find all pixels with the given label
@@ -104,7 +104,7 @@ def extract_label(image, mask, label):
     region_sizes = [len(region) for region in regions]
     max_region_size = max(region_sizes)
 
-    # Filter regions that are bigger than 5% of the biggest one
+    # Filter regions that are bigger than 3% of the biggest one
     filtered_regions = [region for region in regions if len(region) > 0.03 * max_region_size]
 
     # Create a blank mask for the filtered regions
@@ -114,6 +114,29 @@ def extract_label(image, mask, label):
     for region in filtered_regions:
         for y, x in region:
             filtered_mask[y, x] = 1
+
+    # # Find the bounding box of the filtered mask
+    y_indices, x_indices = np.where(filtered_mask == 1)
+    if len(y_indices) == 0 or len(x_indices) == 0:
+        return None  # No regions found
+
+    y_min, y_max = y_indices.min(), y_indices.max()
+    x_min, x_max = x_indices.min(), x_indices.max()
+
+    # Crop the image and mask to the bounding box
+    cropped_image = image[y_min:y_max+1, x_min:x_max+1]
+    cropped_mask = filtered_mask[y_min:y_max+1, x_min:x_max+1]
+
+    # Set colors of all pixels that do not belong to the mask to black
+    image[filtered_mask == 0] = [0, 0, 0]
+
+    return cropped_image, cropped_mask, (y_min, y_max, x_min, x_max)
+
+def extract_label(image, mask, label):
+    image = image.copy()
+
+    # Find all pixels with the given label
+    filtered_mask = np.where(mask == label, 1, 0)
 
     # # Find the bounding box of the filtered mask
     y_indices, x_indices = np.where(filtered_mask == 1)

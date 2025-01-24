@@ -60,7 +60,7 @@ class SimpleCNN(nn.Module):
         self.conv3 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
         self.fc1 = nn.Linear(64 * 8 * 8, 128)
         self.fc2 = nn.Linear(128, 64)
-        self.fc3 = nn.Linear(64, 3)  # 3 classes: background, D40, other
+        self.fc3 = nn.Linear(64, 2)  # 2 classes: background, D40
 
     def forward(self, x):
         x = self.pool(F.relu(self.conv1(x)))
@@ -100,29 +100,30 @@ def cnn_model_training(epochs=10, patience=3):
 
             for obj in root.findall('object'):
                 name = obj.find('name').text
-                bndbox = obj.find('bndbox')
-                xmin = int(bndbox.find('xmin').text)
-                ymin = int(bndbox.find('ymin').text)
-                xmax = int(bndbox.find('xmax').text)
-                ymax = int(bndbox.find('ymax').text)
-                label = 1 if name == 'D40' else 0
+                if name == 'D40':
+                    bndbox = obj.find('bndbox')
+                    xmin = int(bndbox.find('xmin').text)
+                    ymin = int(bndbox.find('ymin').text)
+                    xmax = int(bndbox.find('xmax').text)
+                    ymax = int(bndbox.find('ymax').text)
+                    label = 1
 
-                # Extract positive sample
-                positive_sample = image[ymin:ymax, xmin:xmax]
-                if positive_sample.size > 0:
-                    positive_sample = cv2.resize(positive_sample, self.window_size)
-                    positive_sample = Image.fromarray(positive_sample)  # Convert to PIL image
-                    positive_samples.append((positive_sample, label))
+                    # Extract positive sample
+                    positive_sample = image[ymin:ymax, xmin:xmax]
+                    if positive_sample.size > 0:
+                        positive_sample = cv2.resize(positive_sample, self.window_size)
+                        positive_sample = Image.fromarray(positive_sample)  # Convert to PIL image
+                        positive_samples.append((positive_sample, label))
 
-                # Generate negative samples
-                for _ in range(5):  # Generate 5 negative samples per object
-                    x = random.randint(0, image.shape[1] - self.window_size[0])
-                    y = random.randint(0, image.shape[0] - self.window_size[1])
-                    if x < xmin or x > xmax or y < ymin or y > ymax:
-                        negative_sample = image[y:y + self.window_size[1], x:x + self.window_size[0]]
-                        if negative_sample.size > 0:
-                            negative_sample = Image.fromarray(negative_sample)  # Convert to PIL image
-                            negative_samples.append((negative_sample, 2))  # 2 indicates background
+                    # Generate negative samples
+                    for _ in range(5):  # Generate 5 negative samples per object
+                        x = random.randint(0, image.shape[1] - self.window_size[0])
+                        y = random.randint(0, image.shape[0] - self.window_size[1])
+                        if x < xmin or x > xmax or y < ymin or y > ymax:
+                            negative_sample = image[y:y + self.window_size[1], x:x + self.window_size[0]]
+                            if negative_sample.size > 0:
+                                negative_sample = Image.fromarray(negative_sample)  # Convert to PIL image
+                                negative_samples.append((negative_sample, 0))  # 2 indicates background
 
             samples = positive_samples + negative_samples
             if len(samples) == 0:
@@ -132,7 +133,7 @@ def cnn_model_training(epochs=10, patience=3):
                 negative_sample = image[y:y + self.window_size[1], x:x + self.window_size[0]]
                 if negative_sample.size > 0:
                     negative_sample = Image.fromarray(negative_sample)  # Convert to PIL image
-                    negative_samples.append((negative_sample, 2))
+                    negative_samples.append((negative_sample, 0))
                 samples = negative_samples
 
             random.shuffle(samples)
@@ -169,6 +170,9 @@ def cnn_model_training(epochs=10, patience=3):
             val_loss = 0.0
             correct = 0
             total = 0
+            weighted_correct = 0
+            weighted_total = 0
+
             with torch.no_grad():
                 for images, labels in val_dataloader:
                     images = images.to(device)
@@ -182,20 +186,33 @@ def cnn_model_training(epochs=10, patience=3):
                     total += labels.size(0)
                     correct += (predicted == labels).sum().item()
 
+                    # Apply 10x weight for correct label 1 predictions
+                    for i in range(labels.size(0)):
+                        if labels[i] == 1:
+                            weighted_total += 100
+                            if predicted[i] == labels[i]:
+                                weighted_correct += 100
+                        else:
+                            weighted_total += 1
+                            if predicted[i] == labels[i]:
+                                weighted_correct += 1
+
             val_loss /= len(val_dataloader)
             accuracy = 100 * correct / total
-            print(f"Validation Loss: {val_loss}, Accuracy: {accuracy}%")
+            weighted_accuracy = 100 * weighted_correct / weighted_total
+            print(f"Validation Loss: {val_loss}, Accuracy: {accuracy}%, Weighted Accuracy: {weighted_accuracy}%")
 
             # Early stopping
-            if accuracy < best_val_acc:
+            if weighted_accuracy < best_val_acc:
                 c_patience -= 1
                 if c_patience == 0:
                     model.load_state_dict(best_model_weights)
                     break
             else:
-                best_val_acc = accuracy
+                best_val_acc = weighted_accuracy
                 best_model_weights = copy.deepcopy(model.state_dict())
                 c_patience = patience
+
 
 
     transform = transforms.Compose([
@@ -206,6 +223,8 @@ def cnn_model_training(epochs=10, patience=3):
     # Model training
     xml_folder = 'dataset/Czechtrain/processed_annotations'
     image_folder = 'dataset/Czechtrain/processed_images'
+    # xml_folder = 'dataset/Czechtrain/annotations/xmls'
+    # image_folder = 'dataset/Czechtrain/images'
     # Load all XML files
     xml_files = [os.path.join(xml_folder, f) for f in os.listdir(xml_folder) if f.endswith('.xml')]
 
@@ -245,23 +264,22 @@ def sliding_window(device, image, model, window_size, step_size):
             window = cv2.resize(window, (64, 64))  # Resize to match input size of the model
             window = transforms.ToTensor()(window).unsqueeze(0).to(device)
             with torch.no_grad():
-                output = model(window)
-                probabilities = F.softmax(output, dim=1)
+                probabilities = model(window)
+                probabilities = F.softmax(probabilities, dim=1)
                 confidence, predicted = torch.max(probabilities, 1)
-                if predicted.item() != 2:  # Not background
+                if predicted.item() != 0:  # Not background
                     windows.append((x, y, predicted.item(), confidence.item()))
     return windows
 
-def visualize_detections(image, windows, window_size):
+def visualize_detections(image, windows, window_size, offset=(0, 0)):
+    image = copy.deepcopy(image)
+    offset_x, offset_y = offset
+    windows = [(x, y, label, confidence) for (x, y, label, confidence) in windows if confidence > 0.9]
+    windows = [(x + offset_x, y + offset_y, label, confidence) for (x, y, label, confidence) in windows]
     for (x, y, label, confidence) in windows:
-        color = (0, 255, 0) if label == 1 else (0, 0, 255)
+        color = (0, 255, 0)
         cv2.rectangle(image, (x, y), (x + window_size[0], y + window_size[1]), color, 2)
-        label_text = f'Pothole: {confidence:.2f}' if label == 1 else f'Other: {confidence:.2f}'
-        cv2.putText(image, label_text, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2) 
+        label_text = f'Pothole: {confidence:.2f}'
+        cv2.putText(image, label_text, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
 
-    # Convert BGR to RGB for displaying with matplotlib
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    plt.figure(figsize=(10, 10))
-    plt.imshow(image_rgb)
-    plt.axis('off')
-    plt.show()
+    return image
