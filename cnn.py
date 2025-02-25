@@ -13,43 +13,6 @@ from PIL import Image
 from sklearn.model_selection import train_test_split
 import copy
 
-def load_bounding_box_data(xml_file):
-    tree = ET.parse(xml_file)
-    root = tree.getroot()
-
-    filename = root.find('filename').text
-    size = root.find('size')
-    width = int(size.find('width').text)
-    height = int(size.find('height').text)
-    depth = int(size.find('depth').text)
-
-    objects = []
-    for obj in root.findall('object'):
-        name = obj.find('name').text
-        bndbox = obj.find('bndbox')
-        xmin = int(bndbox.find('xmin').text)
-        ymin = int(bndbox.find('ymin').text)
-        xmax = int(bndbox.find('xmax').text)
-        ymax = int(bndbox.find('ymax').text)
-        objects.append({'name': name, 'bbox': [xmin, ymin, xmax, ymax]})
-
-    return filename, width, height, depth, objects
-
-def visualize_bounding_boxes(image_path, objects):
-    image = cv2.imread(image_path)
-    for obj in objects:
-        name = obj['name']
-        xmin, ymin, xmax, ymax = obj['bbox']
-        cv2.rectangle(image, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
-        cv2.putText(image, name, (xmin, ymin - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-
-    # Convert BGR to RGB for displaying with matplotlib
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    plt.figure(figsize=(10, 10))
-    plt.imshow(image_rgb)
-    plt.axis('off')
-    plt.show()
-
 
 class SimpleCNN(nn.Module):
     def __init__(self):
@@ -73,7 +36,10 @@ class SimpleCNN(nn.Module):
         return x
 
 
-def cnn_model_training(epochs=10, patience=3):
+def cnn_model_training(images_path, annotations_path, epochs=10, patience=3):
+    """Train a SimpleCNN with images and annotations in folders given by images_path and annotations_path correspondingly.
+    Annotations should be in Pascal VOC format."""
+
     class ObjectDetectionDataset(Dataset):
         def __init__(self, xml_folder, image_folder, transform=None, window_size=(64, 64)):
             self.xml_folder = xml_folder
@@ -220,20 +186,15 @@ def cnn_model_training(epochs=10, patience=3):
         transforms.ToTensor(),
     ])
 
-    # Model training
-    xml_folder = 'dataset/Czechtrain/processed_annotations'
-    image_folder = 'dataset/Czechtrain/processed_images'
-    # xml_folder = 'dataset/Czechtrain/annotations/xmls'
-    # image_folder = 'dataset/Czechtrain/images'
     # Load all XML files
-    xml_files = [os.path.join(xml_folder, f) for f in os.listdir(xml_folder) if f.endswith('.xml')]
+    xml_files = [os.path.join(annotations_path, f) for f in os.listdir(annotations_path) if f.endswith('.xml')]
 
     # Split into training and testing sets
     train_files, test_files = train_test_split(xml_files, test_size=0.2)
 
     # Create datasets
-    train_dataset = ObjectDetectionDataset(xml_folder, image_folder, transform=transform)
-    test_dataset = ObjectDetectionDataset(xml_folder, image_folder, transform=transform)
+    train_dataset = ObjectDetectionDataset(annotations_path, images_path, transform=transform)
+    test_dataset = ObjectDetectionDataset(annotations_path, images_path, transform=transform)
 
     # Update the dataset's xml_files attribute
     train_dataset.xml_files = train_files
@@ -274,7 +235,7 @@ def sliding_window(device, image, model, window_size, step_size):
 def visualize_detections(image, windows, window_size, offset=(0, 0)):
     image = copy.deepcopy(image)
     offset_x, offset_y = offset
-    windows = [(x, y, label, confidence) for (x, y, label, confidence) in windows if confidence > 0.9]
+    windows = [(x, y, label, confidence) for (x, y, label, confidence) in windows if confidence > 0.85]
     windows = [(x + offset_x, y + offset_y, label, confidence) for (x, y, label, confidence) in windows]
     for (x, y, label, confidence) in windows:
         color = (0, 255, 0)

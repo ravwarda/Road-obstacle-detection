@@ -5,13 +5,48 @@ import os
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score
 
-from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
+from transformers import AutoImageProcessor, SegformerForSemanticSegmentation, SegformerImageProcessor
 from torch.utils.data import DataLoader, Dataset, random_split
 from torch import nn
 import evaluate
 import copy
 
-def segmentation_model_training(epochs=100, patience=5):
+def image_segmentation(image, model):
+    """Perform image segmentation on the input image using the given model."""
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    processor = AutoImageProcessor.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512")
+    
+    pixel_values = processor(image, return_tensors="pt").pixel_values.to(device)
+
+    with torch.no_grad():
+        outputs = model(pixel_values)
+        logits = outputs.logits
+
+    target_size = image.shape[:2]
+    predicted_segmentation_map = processor.post_process_semantic_segmentation(outputs, target_sizes=[target_size])[0]
+    predicted_segmentation_map = predicted_segmentation_map.cpu().numpy()
+
+    color_seg = np.zeros((predicted_segmentation_map.shape[0],
+                        predicted_segmentation_map.shape[1], 3), dtype=np.uint8) # height, width, 3
+
+    palette = np.array(ade_palette())
+    for label, color in enumerate(palette):
+        color_seg[predicted_segmentation_map == label, :] = color
+    # Convert to BGR
+    color_seg = color_seg[..., ::-1]
+
+    # Show image + mask
+    img = image * 0.5 + color_seg * 0.5
+    img = img.astype(np.uint8)
+
+    return predicted_segmentation_map, img
+
+def segmentation_model_training(root_dir, epochs=100, patience=5):
+    """Finetune a Segformer model with given dataset.
+    root_dir should contain 'train' and 'val' folders with images, 'train_cm' and 'val_cm' with coresponding annotations."""
+
     class SemanticSegmentationDataset(Dataset):
         """Image (semantic) segmentation dataset."""
 
@@ -71,7 +106,6 @@ def segmentation_model_training(epochs=100, patience=5):
 
             return encoded_inputs
         
-    root_dir = "dataset/segmentation_data"
     image_processor = SegformerImageProcessor(do_reduce_labels=True)
 
     train_dataset = SemanticSegmentationDataset(root_dir, image_processor, train=True)
